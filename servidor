@@ -1,29 +1,430 @@
 #!/usr/bin/env python3
 import asyncio
-from tcp import Servidor
 import re
+# Ensure tcp.py is in the same directory or accessible via PYTHONPATH
+from tcp import Servidor
+
+# --- Constants ---
+SERVER_NAME = b"server" # Use the name expected by the tests
+MAX_MSG_LENGTH = 510 # Max length for payload part of a message (512 - \r\n)
+
+# --- Data Structures ---
+connections = {}
+nicknames = {}
+channels = {}
+
+# --- Utility Functions ---
+
+def validar_nome(nome_bytes):
+    if not isinstance(nome_bytes, bytes): return False
+    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome_bytes) is not None
+
+def validar_channel_name(channel_bytes):
+    if not isinstance(channel_bytes, bytes) or not channel_bytes.startswith(b'#'): return False
+    return len(channel_bytes) > 1 and validar_nome(channel_bytes[1:])
 
 
-def validar_nome(nome):
-    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
+def parse_message(line_bytes):
+    line_bytes = line_bytes.strip()
+    prefix = b''
+    if line_bytes.startswith(b':'):
+        try:
+            prefix, line_bytes = line_bytes[1:].split(b' ', 1)
+        except ValueError: return None, None, []
+
+    parts = line_bytes.split(b' :', 1)
+    command_args = parts[0].split(b' ')
+    trailing = parts[1] if len(parts) > 1 else None
+    command = command_args[0].upper()
+    args = [arg for arg in command_args[1:] if arg]
+    if trailing is not None: args.append(trailing)
+    if not command: return None, None, []
+    return prefix, command, args
+
+async def send_message(conexao, *parts):
+    if conexao not in connections: return
+
+    byte_parts = []
+    for part in parts:
+        if isinstance(part, bytes): byte_parts.append(part)
+        elif isinstance(part, str): byte_parts.append(part.encode('utf-8', 'replace'))
+        else: byte_parts.append(str(part).encode('utf-8', 'replace'))
+
+    message = b' '.join(byte_parts) + b'\r\n'
+
+    if len(message) > 512:
+        message = message[:510] + b'\r\n'
+        print(f"Warning: Truncated message longer than 512 bytes to {conexao}")
+
+    # print(f"DEBUG send_message: Sending bytes: {message!r}") # Optional Debug
+    try:
+        conexao.enviar(message)
+    except Exception as e:
+        print(f"Error sending to {conexao}: {e}")
 
 
-def sair(conexao):
-    print(conexao, 'conexão fechada')
-    conexao.fechar()
+async def send_numeric_reply(conexao, numeric_code, *args):
+    """Helper to send standard numeric replies.
+       Automatically includes :server_name code target prefix.
+       'target' is the connection's current nickname or '*'.
+       '*args' are the parameters specific to the numeric reply (AFTER target).
+    """
+    if isinstance(numeric_code, int): numeric_code_bytes = str(numeric_code).zfill(3).encode('ascii')
+    elif isinstance(numeric_code, str): numeric_code_bytes = numeric_code.zfill(3).encode('ascii')
+    else: numeric_code_bytes = numeric_code # Assume bytes
+
+    # Determine the target parameter for the numeric reply
+    state = connections.get(conexao, {}) # Get connection state safely
+    target_nick = state.get('nickname') # Get nickname, could be None
+
+    # Use '*' as the target if the nickname is not set (is None)
+    if target_nick is None:
+        target = b'*'
+    else:
+        target = target_nick
+
+    # Format: :server_name code target parameters...
+    await send_message(conexao, b":" + SERVER_NAME, numeric_code_bytes, target, *args)
 
 
-def dados_recebidos(conexao, dados):
-    if dados == b'':
-        return sair(conexao)
-    print(conexao, dados)
+async def send_names_list(conexao, channel_name_lower):
+    if conexao not in connections: return
+    state = connections.get(conexao, {})
+    joining_user_nick = state.get('nickname')
+    if not joining_user_nick:
+        print(f"ERROR send_names_list: User {conexao} has no nickname.")
+        return
+
+    if channel_name_lower not in channels or not channels.get(channel_name_lower):
+        channel_display_name = channel_name_lower
+        await send_numeric_reply(conexao, b"366", channel_display_name, b":End of /NAMES list.")
+        return
+
+    channel_display_name = channel_name_lower
+    member_nicks_decoded = sorted([
+        connections[member_conn]['nickname'].decode('utf-8', 'replace')
+        for member_conn in channels[channel_name_lower]
+        if member_conn in connections and connections[member_conn].get('nickname')
+    ])
+    prefix_str = f":{SERVER_NAME.decode('ascii')} 353 {joining_user_nick.decode('utf-8','replace')} = {channel_display_name.decode('utf-8','replace')} :"
+    prefix_bytes = prefix_str.encode('utf-8')
+    max_nick_payload_len = MAX_MSG_LENGTH - len(prefix_bytes)
+    current_line_nicks_bytes = []
+    current_len = 0
+    for nick_str in member_nicks_decoded:
+        nick_bytes = nick_str.encode('utf-8', 'replace')
+        nick_len_with_space = len(nick_bytes) + (1 if current_line_nicks_bytes else 0)
+        if current_len + nick_len_with_space <= max_nick_payload_len:
+            current_line_nicks_bytes.append(nick_bytes)
+            current_len += nick_len_with_space
+        else:
+            await send_message(conexao, prefix_bytes + b" ".join(current_line_nicks_bytes))
+            current_line_nicks_bytes = [nick_bytes]
+            current_len = len(nick_bytes)
+    if current_line_nicks_bytes:
+        await send_message(conexao, prefix_bytes + b" ".join(current_line_nicks_bytes))
+    await send_numeric_reply(conexao, b"366", channel_display_name, b":End of /NAMES list.")
+
+# --- Command Handlers ---
+
+async def handle_nick(conexao, args):
+    """Handles the NICK command."""
+    if conexao not in connections: return
+
+    if not args:
+        await send_numeric_reply(conexao, b"431", b":No nickname given")
+        return
+
+    requested_nick_bytes = args[0]
+
+    current_state = connections.get(conexao)
+    if not current_state:
+        print(f"ERROR handle_nick: Connection {conexao} not found.")
+        return
+
+    # Validate Nickname Syntax
+    is_valid = validar_nome(requested_nick_bytes)
+    if not is_valid:
+        # Correct: Pass invalid nick + reason text as args *after* target
+        await send_numeric_reply(conexao, b"432", requested_nick_bytes, b":Erroneous nickname")
+        return
+
+    # --- Nickname syntax is valid, check for uniqueness ---
+    requested_nick_lower = requested_nick_bytes.lower()
+
+    # Check if nickname is already in use by ANOTHER connection
+    if requested_nick_lower in nicknames and nicknames[requested_nick_lower] != conexao:
+        # Correct: Pass conflicting nick + reason text as args *after* target
+        await send_numeric_reply(conexao, b"433", requested_nick_bytes, b":Nickname is already in use")
+        return
+
+    # --- Nickname is valid and available (or changing to the same nick) ---
+    current_nick = current_state.get('nickname')
+    old_nick_lower = current_nick.lower() if current_nick else None
+
+    if old_nick_lower == requested_nick_lower:
+        return # No change needed
+
+    # --- Update server state ---
+    if old_nick_lower and old_nick_lower in nicknames and nicknames[old_nick_lower] == conexao:
+        del nicknames[old_nick_lower]
+    nicknames[requested_nick_lower] = conexao
+    connections[conexao]['nickname'] = requested_nick_bytes
+
+    # --- Handle registration and notifications ---
+    if current_state['registrado']:
+        # --- Changing Nickname ---
+        if not current_nick:
+             print(f"ERROR handle_nick: Registered user {conexao} changing nick, but old nick was None.")
+             current_nick = b"Unknown"
+
+        nick_change_msg = b":" + current_nick + b" NICK " + requested_nick_bytes
+        await send_message(conexao, nick_change_msg) # Notify self
+
+        common_channel_users = set()
+        for channel_name in list(current_state.get('channels', set())):
+            if channel_name in channels:
+                for member_conn in list(channels[channel_name]):
+                    if member_conn != conexao and member_conn in connections:
+                        common_channel_users.add(member_conn)
+        for user_conn in list(common_channel_users):
+            if user_conn in connections:
+                await send_message(user_conn, nick_change_msg) # Notify others
+
+    else:
+        # --- Initial Registration (on first valid NICK) ---
+        connections[conexao]['registrado'] = True
+        # Correct: Pass only the text part; target nick added by send_numeric_reply
+        await send_numeric_reply(conexao, b"001", b":Welcome")
+        # Correct: Pass only the text part; target nick added by send_numeric_reply
+        await send_numeric_reply(conexao, b"422", b":MOTD File is missing")
 
 
+async def handle_ping(conexao, args):
+    if conexao not in connections: return
+    payload = args[0] if args else b""
+    await send_message(conexao, b":" + SERVER_NAME, b"PONG", SERVER_NAME, b":" + payload)
+
+
+async def handle_privmsg(conexao, args):
+    if conexao not in connections: return
+    sender_state = connections.get(conexao)
+    if not sender_state or not sender_state.get('registrado'):
+        await send_numeric_reply(conexao, b"451", b":You have not registered")
+        return
+    if not args:
+         await send_numeric_reply(conexao, b"411", b":No recipient given (PRIVMSG)")
+         return
+    if len(args) < 2:
+         await send_numeric_reply(conexao, b"412", b":No text to send")
+         return
+
+    target_name = args[0]
+    message_content = args[1]
+    sender_nick = sender_state['nickname']
+    source_prefix = b":" + sender_nick
+    target_name_lower = target_name.lower()
+
+    if target_name.startswith(b'#'):
+        if not validar_channel_name(target_name):
+             await send_numeric_reply(conexao, b"403", target_name, b":No such channel")
+             return
+        if target_name_lower not in channels:
+            await send_numeric_reply(conexao, b"403", target_name, b":No such channel")
+            return
+        channel_members = channels.get(target_name_lower, set())
+        if conexao not in channel_members:
+             await send_numeric_reply(conexao, b"404", target_name, b":Cannot send to channel")
+             return
+        msg_to_send = [source_prefix, b"PRIVMSG", target_name, b":" + message_content]
+        for member_conn in list(channel_members):
+            if member_conn != conexao and member_conn in connections:
+                await send_message(member_conn, *msg_to_send)
+    else:
+        if not validar_nome(target_name):
+             await send_numeric_reply(conexao, b"401", target_name, b":No such nick/channel")
+             return
+        target_nick_lower = target_name.lower()
+        if target_nick_lower not in nicknames:
+            await send_numeric_reply(conexao, b"401", target_name, b":No such nick/channel")
+            return
+        recipient_conn = nicknames.get(target_nick_lower)
+        if not recipient_conn or recipient_conn not in connections:
+             if recipient_conn and nicknames.get(target_nick_lower) == recipient_conn: del nicknames[target_nick_lower]
+             await send_numeric_reply(conexao, b"401", target_name, b":No such nick/channel")
+             return
+        msg_to_send = [source_prefix, b"PRIVMSG", target_name, b":" + message_content]
+        await send_message(recipient_conn, *msg_to_send)
+
+
+async def handle_join(conexao, args):
+    if conexao not in connections: return
+    state = connections.get(conexao)
+    if not state or not state.get('registrado'):
+        await send_numeric_reply(conexao, b"451", b":You have not registered")
+        return
+    if not args:
+        await send_numeric_reply(conexao, b"461", b"JOIN", b":Not enough parameters")
+        return
+
+    user_nick = state['nickname']
+    user_channels = state['channels']
+
+    channel_list = args[0].split(b',')
+    for channel_name in channel_list:
+        channel_name = channel_name.strip()
+        if not channel_name: continue
+        if not validar_channel_name(channel_name):
+            if conexao in connections: await send_numeric_reply(conexao, b"403", channel_name, b":No such channel")
+            if conexao not in connections: return
+            continue
+        channel_name_lower = channel_name.lower()
+        if conexao not in connections: return
+        if channel_name_lower in user_channels: continue
+        if channel_name_lower not in channels: channels[channel_name_lower] = set()
+        channel_members = channels[channel_name_lower]
+        join_msg_parts = [b":" + user_nick, b"JOIN", b":" + channel_name]
+        for member_conn in list(channel_members):
+             if member_conn in connections: await send_message(member_conn, *join_msg_parts)
+        channel_members.add(conexao)
+        user_channels.add(channel_name_lower)
+        if conexao not in connections: return
+        await send_message(conexao, *join_msg_parts)
+        asyncio.create_task(send_names_list(conexao, channel_name_lower))
+
+
+async def handle_part(conexao, args):
+    if conexao not in connections: return
+    state = connections.get(conexao)
+    if not state or not state.get('registrado'):
+        await send_numeric_reply(conexao, b"451", b":You have not registered")
+        return
+    if not args:
+        await send_numeric_reply(conexao, b"461", b"PART", b":Not enough parameters")
+        return
+
+    user_nick = state['nickname']
+    user_channels = state['channels']
+
+    channel_list = args[0].split(b',')
+
+    for channel_name in channel_list:
+        channel_name = channel_name.strip()
+        if not channel_name: continue
+        channel_name_lower = channel_name.lower()
+        if conexao not in connections: return
+        if channel_name_lower not in user_channels or channel_name_lower not in channels:
+            await send_numeric_reply(conexao, b"442", channel_name, b":You're not on that channel")
+            continue
+        channel_members = channels[channel_name_lower]
+        part_msg_parts = [b":" + user_nick, b"PART", channel_name] # No reason
+        members_to_notify = list(channel_members)
+        channel_members.discard(conexao)
+        user_channels.discard(channel_name_lower)
+        if conexao not in connections: return
+        for member_conn in members_to_notify:
+             if member_conn in connections: await send_message(member_conn, *part_msg_parts)
+        if not channels.get(channel_name_lower):
+            if channel_name_lower in channels: del channels[channel_name_lower]
+
+
+async def handle_quit(conexao, reason=b"Connection closed"):
+    if conexao not in connections:
+        try: conexao.fechar()
+        except Exception: pass
+        return
+    state = connections.pop(conexao)
+    print(f"{conexao} : Conexão fechada (Nick: {state.get('nickname')!r}, Reason: {reason!r})")
+    nickname = state.get('nickname')
+    if nickname:
+        nickname_lower = nickname.lower()
+        user_channels = state.get('channels', set())
+        quit_msg_parts = [b":" + nickname, b"QUIT", b":" + reason]
+        notified_users = set()
+        if nickname_lower in nicknames and nicknames.get(nickname_lower) == conexao:
+            del nicknames[nickname_lower]
+        for channel_name in list(user_channels):
+            if channel_name in channels:
+                channel_members = channels[channel_name]
+                channel_members.discard(conexao)
+                members_to_notify = list(channel_members)
+                for member_conn in members_to_notify:
+                    if member_conn in connections and member_conn not in notified_users:
+                        await send_message(member_conn, *quit_msg_parts)
+                        notified_users.add(member_conn)
+                if not channel_members:
+                     if channel_name in channels: del channels[channel_name]
+    try: conexao.fechar()
+    except Exception as e: print(f"Error closing socket for {conexao}: {e}")
+
+# --- Command Handlers Map ---
+command_handlers = {
+    b'NICK': handle_nick, b'PING': handle_ping, b'PRIVMSG': handle_privmsg,
+    b'JOIN': handle_join, b'PART': handle_part,
+    b'QUIT': lambda c, a: asyncio.create_task(handle_quit(c, a[0] if a else b"Client quit"))
+}
+
+# --- Server Callbacks & Main ---
+async def dados_recebidos_async(conexao, dados):
+    if conexao not in connections: return
+    if dados == b'': await handle_quit(conexao, b"Connection closed"); return
+
+    connections[conexao].setdefault('buffer', b'')
+    connections[conexao]['buffer'] += dados
+    buffer = connections[conexao]['buffer']
+
+    while b'\r\n' in buffer:
+        if conexao not in connections: break
+        line, buffer = buffer.split(b'\r\n', 1)
+        connections[conexao]['buffer'] = buffer
+
+        prefix, command, args = parse_message(line)
+        if command is None: continue
+
+        handler = command_handlers.get(command)
+        if handler:
+            try: await handler(conexao, args)
+            except Exception as e:
+                print(f"!!! Error handling command {command!r} from {conexao}: {e}"); import traceback; traceback.print_exc()
+        else:
+            if connections.get(conexao, {}).get('registrado'):
+                 await send_numeric_reply(conexao, b"421", command, b":Unknown command")
+
+def dados_recebidos(conexao, dados): asyncio.create_task(dados_recebidos_async(conexao, dados))
 def conexao_aceita(conexao):
-    print(conexao, 'nova conexão')
+    """Callback for when a new connection is accepted."""
+    print(f"{conexao} : Nova conexão")
+    if conexao in connections:
+        print(f"Warning: Conn {conexao} already exists.")
+        try: conexao.fechar()
+        except Exception: pass
+        return
+
+    connections[conexao] = {'nickname': None, 'registrado': False, 'channels': set(), 'buffer': b''}
     conexao.registrar_recebedor(dados_recebidos)
 
+if __name__ == "__main__":
+    port = 6667
+    print(f"Starting Simplified IRC server on 0.0.0.0:{port}...")
+    try: from tcp import Servidor
+    except ImportError: print("Error: tcp.py not found."); exit(1)
 
-servidor = Servidor(6667)
-servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
-asyncio.get_event_loop().run_forever()
+    try: loop = asyncio.get_running_loop()
+    except RuntimeError: loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+
+    servidor = Servidor(port)
+    servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+    try: loop.run_forever()
+    except KeyboardInterrupt: print("\nShutting down server...")
+    finally:
+        print("Closing listening socket...")
+        try:
+            if hasattr(servidor, 's') and servidor.s: servidor.s.close()
+        except Exception as e: print(f"Error closing server socket: {e}")
+        print("Closing client connections...")
+        tasks = [loop.create_task(handle_quit(conn, b"Server shutting down"))
+                 for conn in list(connections.keys())]
+        if tasks:
+            try: loop.run_until_complete(asyncio.wait(tasks, timeout=0.5))
+            except Exception as e: print(f"Error during cleanup: {e}")
+        print("Server stopped.")
